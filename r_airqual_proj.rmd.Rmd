@@ -1,0 +1,605 @@
+
+---
+title: "Can We Predict Hourly Air Quality Using Just Time and Location?"
+author: "Camron Jacobson  \nUniversity of California, Santa Barbara | Spring 2025"
+date: "2025-05-08"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: readable
+    highlight: tango
+    latex_engine: xelatex
+    warnings: false
+    messages: false
+---
+
+# Introduction
+
+Poor air quality is one of the biggest public health challenges facing cities today — from wildfire smoke and smog to everyday traffic pollution. In the United States, the Environmental Protection Agency (EPA) monitors major pollutants through an extensive network of sensors and reports air quality using the Air Quality Index (AQI), a standardized scale that helps people plan daily activities safely.
+
+However, sensor networks have gaps: equipment can fail, and real-time data may be delayed. In highly populated regions like Southern California, where air quality can change quickly due to weather or wildfires, there’s real value in knowing if we can roughly estimate the AQI category even when a direct measurement is missing.
+
+This project explores whether simple information — like the hour of day, day of week, and geographic location, carries enough signal to predict the hourly AQI category using supervised machine learning. While motivated by my experience living in Santa Barbara, this project uses nationwide data to test the idea in a broader context.
+
+
+
+# Project Goal
+
+
+The main question is: Given only the time and location, can we accurately classify whether the air quality is “Good,” “Moderate,” or “Unhealthy for Sensitive Groups”?
+
+To answer this, I compiled hourly PM2.5 readings from the EPA, converted them into AQI categories, and then built and compared multiple machine learning models — including decision trees, random forests, and other classifiers. Importantly, I did not feed the raw PM2.5 measurement to the model, so it would be forced to learn patterns from context alone.
+
+My goal is to demonstrate how machine learning could fill in gaps in real-time air quality monitoring, offering a rough backup signal when direct readings are unavailable.
+
+
+## Personal Motivation
+
+This project holds personal significance for me as a resident of Isla Vista, where air quality warnings are a common part of life, mostly from wildfires. By building this model, I wanted to gain hands-on experience with environmental data science and also deepen my understanding of how the same algorithms used in finance or marketing can be repurposed to help people breathe cleaner air.
+
+More broadly, this work highlights an important intersection of data science, environmental policy, and public health, reminding us that behind each AQI number is a community of people trying to plan their day while staying healthy and informed.
+
+
+Additionally, this project is personally meaningful because clean air is something many of us take for granted. I wanted to better understand the data behind air pollution alerts I often see in the United States and how machine learning can potentially forecast and mitigate these public health warnings.
+
+# Describing the Predictors
+
+Before modeling, it's important to understand what information is available and how it might influence the target variable.
+
+### Codebook
+
+Here I have provided a table of all the variables I will be using in my project. 
+
+| Variable           | Type        | Description |
+|--------------------|--------------|-------------|
+| `sample_measurement` | Numeric    | PM2.5 concentration in micrograms per cubic meter |
+| `date_local`       | Date         | Date when the measurement was recorded |
+| `time_local`       | Time         | Time when the measurement was recorded |
+| `latitude`         | Numeric      | Latitude of the monitoring site |
+| `longitude`        | Numeric      | Longitude of the monitoring site |
+| `hour`             | Integer      | Extracted hour of the day (0–23) |
+| `weekday`          | Categorical  | Day of the week (Sun–Sat) |
+| `state_name`       | Categorical  | Name of the U.S. state |
+| `aqi_category`     | Categorical  | Air Quality Index category assigned based on PM2.5 level |
+
+
+# Exploratory Data Analysis (EDA)
+
+Before diving into modeling, I wanted to gain a better understanding of the structure and behavior of PM2.5 measurements over time and geography. This exploratory phase prompted several questions.
+
+Here are some fun packages that I will be using:
+```{r packages, message=FALSE, warning=FALSE, include=TRUE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(knitr)
+library(tidymodels)
+library(janitor)
+library(xgboost)
+library(glmnet)
+library(naivebayes)
+library(ranger)
+library(tune)
+library(forcats)
+library(kernlab)     
+library(pROC)
+library(discrim)
+library(vip)
+```
+
+## Load and Clean Data
+
+**Data Source:**  
+The dataset used in this project comes from the U.S. Environmental Protection Agency’s [Air Quality System (AQS) Data Mart](https://aqs.epa.gov/aqsweb/airdata/download_files.html). I downloaded the **hourly PM₂.₅ measurements for 2023**, filtered for valid method codes, and removed unnecessary fields for clarity.  
+
+**Formal Citation:** U.S. Environmental Protection Agency. (2023). *Air Quality System (AQS) Data Mart: Hourly PM₂.₅ Measurements*. Retrieved from [https://aqs.epa.gov/aqsweb/airdata/download_files.html](https://aqs.epa.gov/aqsweb/airdata/download_files.html)
+
+To ensure data quality, I filtered the dataset to include only valid PM₂.₅ measurement methods (codes 636, 638, 736, and 738) and removed fields like `uncertainty` and `qualifier` that were not needed for modeling.
+
+```{r load-clean-data, echo=FALSE, include=FALSE}
+aq_data <- read_csv("hourly_88101_2023.csv") %>%
+  clean_names() %>%
+  filter(method_code %in% c(636, 638, 736, 738)) %>%
+  select(-uncertainty, -qualifier) %>%
+  mutate(
+    date = ymd(date_local),
+    time = hms(time_local),
+    hour = hour(time),
+    weekday = wday(date, label = TRUE)
+  )
+
+```
+
+
+### Q1: Does PM2.5 exhibit a predictable daily pattern?
+
+First, let's see how PM2.5 measurements are distributed overall. This histogram shows how often different pollution levels occur. Most PM2.5 measurements cluster below 25 µg/m³, with very few readings exceeding 50 µg/m³ — indicating typical air conditions are usually within low to moderate ranges.
+```{r pm25-hist, warning=FALSE}
+ggplot(aq_data, aes(x = sample_measurement)) +
+  geom_histogram(bins = 60, fill = "skyblue", color = "white") +
+  scale_x_continuous(limits = c(0,100)) +
+  labs(title = "Distribution of PM2.5 Levels",
+       x = "PM2.5 (ug/m^3)", y = "Frequency") +
+  theme_minimal()
+```
+
+
+Next, I explore how PM2.5 changes during a typical day. On average, PM2.5 dips to its lowest point around 3–5 AM (~8–8.5 µg/m³) and gradually rises throughout the day, peaking in the evening near 9–10 PM (~8.5-9.5 µg/m³), consistent with increased human activity and traffic.
+
+
+```{r pm25-hour, warning=FALSE}
+aq_data %>%
+  group_by(hour) %>%
+  summarise(avg_pm = mean(sample_measurement, na.rm = TRUE)) %>%
+  ggplot(aes(x = hour, y = avg_pm)) +
+  geom_line(color = "darkred", linewidth = 1.2) +
+  labs(title = "PM2.5 Levels by Hour of Day", x = "Hour", y = "Avg PM2.5") +
+  theme_minimal()
+```
+
+## Q2: Are there weekly patterns in PM2.5 levels? (Boxplot)
+
+Using boxplots grouped by day of week, I observed that PM2.5 tends to be slightly elevated on weekdays compared to weekends. This trend suggests the influence of weekday commuting and industrial activity.
+
+```{r box-weekday, warning=FALSE}
+ggplot(aq_data, aes(x = weekday, y = sample_measurement)) +
+  geom_boxplot(fill = "forestgreen") +
+  labs(title = "PM2.5 by Weekday", x = "Day", y = "PM2.5") +
+  theme_minimal()
+```
+
+
+## Q3: Do states vary significantly in average PM2.5 levels?
+
+To explore this, I plotted faceted time series of daily PM2.5 levels for a few representative states. California shows noticeable spikes that can reach over 40 µg/m³, often driven by wildfire smoke and dense urban areas, while states like Vermont and Maine maintain stable, low averages near 5–10 µg/m³. New York and Texas fall somewhere in between, with moderate levels and occasional peaks, highlighting clear regional differences in air quality patterns.
+
+
+```{r pm25-time, fig.width=10, fig.height=5, message=FALSE, warning=FALSE}
+# Focus on a few key states to match the narrative
+selected_states <- c("California", "Vermont", "Maine", "New York", "Texas")
+
+aq_data %>%
+  filter(state_name %in% selected_states) %>%
+  group_by(date, state_name) %>%
+  summarise(avg_pm = mean(sample_measurement, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = avg_pm)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~state_name, scales = "fixed", ncol = 3) +
+  labs(
+    title = "Daily PM2.5 Trends for Selected States (Same Y-axis)",
+    y = "PM2.5 (µg/m³)",
+    x = "Date"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(size = 10)
+  )
+
+
+
+```
+
+
+## Q4: Are there patterns when combining day of the week and hour of the day?
+
+To dive deeper, I created a heatmap of PM2.5 levels by hour and weekday. The heatmap revealed that PM2.5 levels generally peak in the early evening on weekdays, particularly Monday through Friday. On weekends, the peaks are slightly lower and more spread out. This supports the idea that human-driven activity like commuting and industry plays a major role in short-term air quality.
+
+```{r heatmap, warning=FALSE}
+aq_data %>%
+  group_by(hour, weekday) %>%
+  summarise(avg_pm = mean(sample_measurement)) %>%
+  ggplot(aes(x = hour, y = fct_rev(weekday), fill = avg_pm)) +
+  geom_tile() +
+  scale_fill_gradient(low = "lightyellow", high = "red") +
+  labs(title = "Heatmap: PM2.5 by Hour and Day", x = "Hour", y = "Day") +
+  theme_minimal()
+```
+
+
+## Q5: Which features are correlated with PM2.5 levels?
+
+I calculated a correlation matrix between PM2.5 and predictors like latitude, longitude, and hour of day. The matrix showed very weak correlations across the board. This implies that no single numeric feature alone strongly predicts PM2.5 levels. This makes sense and adds to a good justification for including them all in the model to capture interactions and nonlinearities.
+
+```{r correlation, warning=FALSE}
+cor_data <- aq_data %>%
+  select(sample_measurement, latitude, longitude, hour) %>%
+  cor(use = "pairwise.complete.obs")
+kable(round(cor_data, 2))
+```
+
+## Q6: How are PM2.5 readings distributed geographically? (Color = PM2.5)
+
+To explore spatial variation, I plotted a sample of monitoring site readings across the U.S., colored by PM2.5 level. The map showed elevated readings in urban areas like Los Angeles and New York, while rural areas tended to have lower concentrations. This supports the inclusion of latitude and longitude in my prediction models.
+
+```{r map, warning=FALSE, message=FALSE}
+set.seed(131)
+sample_sites <- aq_data %>% 
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  sample_n(2000)
+
+ggplot(sample_sites, aes(x = longitude, y = latitude, color = sample_measurement)) +
+  geom_point(alpha = 0.5) +
+  scale_color_gradient(low = "green", high = "red") +
+  labs(title = "Sample of Monitoring Sites", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+
+
+# Feature Engineering & AQI Category Labeling
+
+
+These questions helped shape my expectations for modeling. For instance, I expected location and time variables to contribute meaningful information to AQI prediction.
+
+Before jumping straight into building models, though, I needed to translate what I had learned from the exploratory phase into a form that machine learning algorithms could work with. This meant transforming the raw data into features that the models could understand and learn from. In particular, I wanted to reflect the EPA's actual AQI guidelines in a categorical outcome variable, and I needed to decide which predictors to include and how to format them appropriately. That brought me to the feature engineering step.. For instance, I expected location and time variables to contribute meaningful information to AQI prediction.
+
+To prepare for modeling, I created a categorical variable, aqi_category, based on EPA-defined thresholds for PM2.5 concentration. These categories are:
+
+Good
+
+Moderate
+
+Unhealthy for Sensitive Groups
+
+Unhealthy
+
+Very Unhealthy
+```{r feature-aqi}
+aq_data <- aq_data %>%
+  mutate(aqi_category = case_when(
+    sample_measurement <= 12.0 ~ "Good",
+    sample_measurement <= 35.4 ~ "Moderate",
+    sample_measurement <= 55.4 ~ "Unhealthy for Sensitive Groups",
+    sample_measurement <= 150.4 ~ "Unhealthy",
+    TRUE ~ "Very Unhealthy"
+  )) %>%
+  mutate(aqi_category = factor(aqi_category, levels = c("Good", "Moderate", "Unhealthy for Sensitive Groups", "Unhealthy", "Very Unhealthy")))
+```
+
+# Data Splitting
+
+With our features engineered and ready, the next step was to prepare the data for model training and evaluation. Since the dataset was quite large — over 9 million rows originally — I sampled a balanced subset of around 10,000 observations, evenly distributed across AQI categories. This allowed for faster experimentation while maintaining class representation.
+
+I split this sample into training and test sets using a 75/25 split. Stratified sampling ensured that each AQI class was proportionally represented in both sets, which is important for fair model evaluation.
+
+
+```{r data-split}
+set.seed(131)
+aq_sample <- aq_data %>%
+  group_by(aqi_category) %>%
+  slice_sample(n = 2000) %>%  # ~10,000 total rows
+  ungroup()
+
+split <- initial_split(aq_sample, prop = 0.75, strata = aqi_category)
+train_data <- training(split)
+test_data <- testing(split)
+
+```
+
+# Building Prediction Models
+
+
+To keep things organized, I used a recipe from the tidymodels framework to handle my preprocessing steps. Specifically, I converted the categorical weekday variable into dummy variables, and I normalized all the numeric predictors — like latitude, longitude, and hour — so that everything would be on the same scale.
+
+One important choice I made for this project was to leave out the sample_measurement variable on purpose. Since the AQI categories come directly from these measurements, including them would basically let the model just memorize the cutoff rules, which defeats the purpose of predicting. By removing this obvious shortcut, I wanted to see if the model could still find useful patterns in the context data — like time of day and location — to make an educated guess about air quality. It makes the problem harder, but a lot more realistic and interesting.
+
+
+
+First, I define how to preprocess the data.
+```{r recipe}
+recipe_obj <- recipe(aqi_category ~latitude + longitude + hour + weekday, data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+# Model Training
+
+After reworking my dataset to leave out the direct PM2.5 measurements, I trained several models to see if they could still guess the air quality category just from when and where the reading was taken. This turned out to be a much tougher challenge than before — which is exactly what I wanted. By removing the main variable that literally defines AQI, the models were forced to rely on more subtle patterns instead of just memorizing the EPA thresholds.
+
+I tested a variety of models, including a decision tree, random forest, XGBoost, Lasso regression, and a support vector machine. I tuned each one using five-fold cross-validation to get a fair estimate of how well they’d perform on new data. Compared to the first version of this project (which hit nearly perfect accuracy for obvious reasons), the cross-validated accuracy now dropped to a range around 40–50%. This makes sense because predicting air quality without a direct measurement is genuinely hard — location and time only tell part of the story.
+
+```{r model-training, echo=FALSE, message=FALSE, warning=FALSE}
+folds <- vfold_cv(train_data, v = 5, strata = aqi_category)
+
+log_mod <- multinom_reg() %>% set_engine("nnet") %>% set_mode("classification")
+cart_mod <- decision_tree() %>% set_engine("rpart") %>% set_mode("classification")
+rf_mod <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 300
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+xgb_mod <- boost_tree(trees = 300, mtry = tune(), learn_rate = tune()) %>% set_engine("xgboost") %>% set_mode("classification")
+lasso_mod <- logistic_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet") %>% set_mode("classification")
+svm_mod <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>% set_engine("kernlab") %>% set_mode("classification")
+nb_mod <- naive_Bayes() %>% set_engine("naivebayes")
+
+models <- list(log_mod, cart_mod, rf_mod, xgb_mod, lasso_mod, svm_mod, nb_mod)
+names(models) <- c("Logistic", "Tree", "RF", "XGB", "Lasso", "SVM", "NB")
+```
+
+# Establishing Simple Baseline Models
+
+
+Before diving deep into tuning more complex machine learning models, I wanted to first set a realistic benchmark. A good practice in any predictive modeling project is to fit a few simple models without any special tuning — this gives a baseline to compare against the performance of more advanced methods later on.
+
+For this, I chose Logistic Regression and Naive Bayes classifiers. Both are quick to train and easy to interpret, making them perfect for setting a first bar of what accuracy might look like when using only basic contextual features (location, hour, weekday) and no fancy hyperparameter tricks.
+
+## Fitting the Logistic Regression Baseline
+
+I first fit a standard logistic regression model. This model tries to find the best linear boundaries between the AQI categories based on time and location. It won’t capture complex nonlinear relationships, but it’s a solid starting point.
+```{r log_wf}
+# Logistic Regression
+log_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(log_mod)
+
+log_fit <- fit(log_wf, data = train_data)
+```
+Once fitted, I used the logistic regression model to predict on the holdout test data and check how often it correctly classifies the air quality category.
+```{r log_preds}
+# Make predictions and check accuracy for Logistic Regression
+log_preds <- predict(log_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(aqi_category))
+
+accuracy(log_preds, truth = aqi_category, estimate = .pred_class)
+
+```
+
+## Fitting the Naive Bayes Baseline
+
+Next, I trained a simple Naive Bayes model. Naive Bayes works on the principle that features are conditionally independent given the class — which is a strong assumption, but surprisingly effective in many cases.
+
+```{r Fitting Four Models}
+# Build a workflow for Naive Bayes
+nb_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(nb_mod)
+
+# Fit Naive Bayes on training data
+nb_fit <- fit(nb_wf, data = train_data)
+```
+Like with the logistic regression, I tested the Naive Bayes predictions on the test set to get a feel for how well it does at classifying AQI categories with minimal tuning.
+
+```{r accuracy}
+# Make predictions and check accuracy for Naive Bayes
+nb_preds <- predict(nb_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(aqi_category))
+
+accuracy(nb_preds, truth = aqi_category, estimate = .pred_class)
+
+```
+
+## Interpreting the Baselines
+
+Seeing how these straightforward models perform gives a clear reference point: any advanced machine learning method I try should ideally beat these baseline accuracies. If a tuned Random Forest or XGBoost does worse than a basic logistic regression, that’s a red flag! This baseline step helps keep the final analysis honest and grounded.
+
+# Model Tuning and Evaluation
+
+Next, I tuned the more flexible models — decision tree, random forest, XGBoost, Lasso, and SVM — using a grid search to find the best hyperparameters.
+
+Parallel processing was used to speed up computation.
+```{r model-tuning, message=FALSE, warning=FALSE, echo=FALSE}
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores())
+
+set.seed(131)
+folds <- vfold_cv(train_data, v = 5, strata = aqi_category)
+
+# --- Decision Tree
+cart_mod <- decision_tree(cost_complexity = tune(), tree_depth = tune()) %>%
+  set_engine("rpart") %>% set_mode("classification")
+
+cart_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(cart_mod)
+
+cart_grid <- grid_regular(cost_complexity(), tree_depth(), levels = 3)
+
+cart_res <- tune_grid(cart_wf, resamples = folds, grid = cart_grid,
+                      metrics = metric_set(accuracy), control = control_grid(save_pred = TRUE))
+
+# --- Random Forest
+rf_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 300) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(rf_mod)
+
+rf_grid <- grid_regular(mtry(range = c(1, 10)), min_n(), levels = 3)
+
+rf_res <- tune_grid(rf_wf, resamples = folds, grid = rf_grid,
+                    metrics = metric_set(accuracy), control = control_grid(save_pred = TRUE))
+
+# --- XGBoost
+xgb_mod <- boost_tree(trees = 300, mtry = tune(), learn_rate = tune(), loss_reduction = tune()) %>%
+  set_engine("xgboost") %>% set_mode("classification")
+
+xgb_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(xgb_mod)
+
+xgb_grid <- grid_latin_hypercube(
+  mtry(range = c(1, 10)), learn_rate(), loss_reduction(), size = 10
+)
+
+xgb_res <- tune_grid(xgb_wf, resamples = folds, grid = xgb_grid,
+                     metrics = metric_set(accuracy), control = control_grid(save_pred = TRUE))
+
+# --- Lasso
+lasso_mod <- multinom_reg(
+  penalty = tune(), 
+  mixture = 1
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lasso_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(lasso_mod)
+
+# Use log scale for penalty
+lasso_grid <- grid_regular(
+  penalty(range = c(-4, 0)),  # log10 scale: 1e-4 to 1
+  levels = 10
+)
+
+lasso_res <- tune_grid(
+  lasso_wf,
+  resamples = folds,
+  grid = lasso_grid,
+  metrics = metric_set(accuracy),
+  control = control_grid(save_pred = TRUE)
+)
+
+# Check notes immediately
+collect_notes(lasso_res)
+
+
+# --- SVM
+svm_mod <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>% set_mode("classification")
+
+svm_wf <- workflow() %>%
+  add_recipe(recipe_obj) %>%
+  add_model(svm_mod)
+
+svm_grid <- grid_regular(cost(), rbf_sigma(), levels = 4)
+
+svm_res <- tune_grid(svm_wf, resamples = folds, grid = svm_grid,
+                     metrics = metric_set(accuracy), control = control_grid(save_pred = TRUE))
+
+# Save results to file
+save(cart_res, rf_res, xgb_res, lasso_res, svm_res, file = "model_tuning_results.RData")
+```
+What does this mean?
+
+These tuning steps search for the best settings (like tree depth, number of features, learning rate) that maximize classification accuracy. This is critical for complex models to avoid overfitting or underfitting.
+
+
+Finally, I compared all the tuned models side by side:
+
+```{r compare-models, message=FALSE, warning=FALSE, echo=FALSE}
+# Load the tuning results
+load("model_tuning_results.RData")
+
+# Extract accuracy results from each tuned model
+cart_acc <- collect_metrics(cart_res) %>% filter(.metric == "accuracy") %>% mutate(Model = "Decision Tree")
+rf_acc   <- collect_metrics(rf_res)   %>% filter(.metric == "accuracy") %>% mutate(Model = "Random Forest")
+xgb_acc  <- collect_metrics(xgb_res)  %>% filter(.metric == "accuracy") %>% mutate(Model = "XGBoost")
+lasso_acc <- collect_metrics(lasso_res) %>% filter(.metric == "accuracy") %>% mutate(Model = "Lasso")
+svm_acc   <- collect_metrics(svm_res)   %>% filter(.metric == "accuracy") %>% mutate(Model = "SVM (RBF)")
+
+# Combine into one dataframe
+all_results <- bind_rows(cart_acc, rf_acc, xgb_acc, lasso_acc, svm_acc)
+
+# Plot
+ggplot(all_results, aes(x = reorder(Model, mean), y = mean, fill = Model)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), width = 0.2) +
+  coord_flip() +
+  labs(title = "Cross-Validated Accuracy by Model",
+       x = "Model", y = "Accuracy (proportion)") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal()
+
+```
+
+While the SVM (RBF) model slightly outperformed the others in cross-validation, I ultimately chose the Random Forest for my final testing because it balances strong predictive power with easier interpretability and provides useful insights like variable importance. This makes it a practical and robust choice for an applied environmental prediction problem like this.
+
+In the next section, I show how the Random Forest performed on truly unseen data.
+
+
+# Performance on New Data
+
+After selecting the Random Forest based on a balance of predictive power and interpretability, I tested it on the unseen holdout test set. The final test accuracy was about **46.0**, meaning the model correctly predicted the AQI category slightly less than half the time. 
+
+While this might sound low at first glance, it’s realistic for this context: air quality can change quickly due to sudden weather shifts, traffic surges, or events like wildfires — none of which are fully captured by just location and time of day alone. The confusion matrix confirms that the model does reasonably well distinguishing the most extreme categories (like “Very Unhealthy”), but it sometimes confuses the middle categories, which is expected given the subtle thresholds between them.
+
+
+### Model Performance Comparison
+
+```{r best-model, echo=FALSE}
+# Combine
+all_acc <- bind_rows(cart_acc, rf_acc, xgb_acc, svm_acc, lasso_acc)
+best_row <- all_acc %>% arrange(desc(mean)) %>% dplyr::slice(1)
+
+# Debug: see what the winner is
+print(best_row$Model)
+
+# Pick best workflow and res
+if (best_row$Model == "Random Forest") {
+  best_res <- rf_res
+  best_wf <- rf_wf
+} else if (best_row$Model == "Decision Tree") {
+  best_res <- cart_res
+  best_wf <- cart_wf
+} else if (best_row$Model == "XGBoost") {
+  best_res <- xgb_res
+  best_wf <- xgb_wf
+} else if (best_row$Model == "SVM (RBF)") {
+  best_res <- svm_res
+  best_wf <- svm_wf
+} else if (best_row$Model == "Lasso") {
+  best_res <- lasso_res
+  best_wf <- lasso_wf
+} else {
+  stop(paste("Unknown model name:", best_row$Model))
+}
+
+# Finalize
+best_model_params <- select_best(best_res, metric = "accuracy")
+final_best_model <- finalize_workflow(best_wf, best_model_params) %>%
+  fit(data = train_data)
+
+# Predict on test set
+test_preds <- predict(final_best_model, new_data = test_data, type = "prob") %>%
+  bind_cols(predict(final_best_model, new_data = test_data)) %>%
+  bind_cols(test_data %>% select(aqi_category))
+
+# Metrics
+conf_mat(test_preds, truth = aqi_category, estimate = .pred_class)
+accuracy(test_preds, truth = aqi_category, estimate = .pred_class)
+
+
+```
+
+Looking at the confusion matrix and final test accuracy, it’s clear that my chosen model struggles most with the middle categories, which is not surprising given how subtle the differences in PM2.5 levels can be around category thresholds. The model performs best at correctly classifying the extreme ends of the spectrum — for example, “Very Unhealthy” has the highest true positive rate, while categories like “Moderate” and “Unhealthy for Sensitive Groups” often get confused with each other.  
+
+Overall, the final accuracy on unseen data is around 46%, which aligns with the cross-validated scores and confirms that predicting AQI categories without direct pollutant readings is genuinely challenging. However, this exercise demonstrates that time of day and location do carry meaningful signals, and the model can still provide a useful rough estimate of air quality in the absence of sensor data.  
+
+
+### Why This Is Still Useful
+
+One key takeaway from this project is that trying to predict AQI without a sensor reading is far from trivial, and my results highlight that fact. The models found some signal in the data, which is encouraging, but they also remind us why real-time sensors are so important for public health warnings.
+
+Even so, this approach has value: if sensor data is missing or delayed, a model like this could still give people a rough heads-up about whether air quality might dip into an unhealthy range based on when and where they are. In future work, I’d like to add weather information like wind, humidity, and temperature, which I suspect would boost accuracy quite a bit. It would also be interesting to test this with more advanced models or even live satellite data to pick up on smoke plumes or dust storms in real time.
+
+To wrap up, I wanted to peek inside the best-performing Random Forest model to see how it was making its predictions. One helpful way to do this is by looking at a variable importance plot, which ranks the predictors by how much they contributed to the model’s decisions.
+
+Below, you can see which features the Random Forest relied on most when guessing the AQI category without the direct PM2.5 measurement — offering a final glimpse into what patterns it found in the time and location data.
+```{r vip}
+#Variable Importance Plot for best Random Forest
+vip(final_best_model$fit$fit)
+```
+
+From this plot, it is clear that hour and weekday are the most important predictors. This aligns with real-world expectations because air pollution levels often change throughout the day and week due to traffic patterns, workdays, and industrial activity. The latitude and longitude variables also play a meaningful role by capturing regional location differences, which help the model predict local air quality trends.
+
+
+# Final Thoughts
+
+
+This project started with a simple but important question: Can we predict hourly air quality using just time and location? By exploring nationwide PM₂.₅ data and testing several machine learning models, I found that context like time of day, day of the week, and geographic location does carry some predictive power, but its far from perfect..
+
+My best model, a tuned random forest, correctly classified the AQI category about 45% of the time. This result is realistic since air pollution can change rapidly due to weather, traffic, or sudden events like wildfires, and these factors aren’t fully captured just by time and coordinates. Still, the model shows that even limited information can provide a rough estimate of air quality when sensor data is missing or delayed.
+
+If I were to continue with this project, I would include more real-time variables like weather data (temperature, wind speed, humidity) and perhaps satellite smoke plume detection to improve accuracy. Combining machine learning with proper sensor networks could make public health warnings even more reliable, something that California could use even more of. 
+
+Overall, working on this project gave me hands-on experience in data cleaning, feature engineering, and model tuning — but more importantly, it showed me how data science can be used to tackle everyday challenges that directly impact people’s health and quality of life.
+
